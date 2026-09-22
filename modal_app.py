@@ -112,59 +112,63 @@ class VocalForge:
 
         # -------- Voice cloning (Base model) --------
         @fapp.post("/api/clone")
-        async def clone(
-            ref_audio: UploadFile = File(...),
-            ref_text: str = Form(""),
-            target_text: str = Form(...),
-            speed: float = Form(1.0),          # ← 0.5 – 2.0
-        ):
-            target_text = target_text.strip()
-            if not target_text:
-                raise HTTPException(400, "Target text cannot be empty")
-            if len(target_text) > 500:
-                raise HTTPException(400, "Target text exceeds 500 characters")
-
-            # Clamp speed to a sane range
-            speed = max(0.5, min(2.0, float(speed)))
-
-            data = await ref_audio.read()
+    def clone(  # ← no async
+        ref_audio: UploadFile = File(...),
+        ref_text: str = Form(""),
+        target_text: str = Form(...),
+        speed: float = Form(1.0),
+    ):
+        import os, io, uuid
+        import numpy as np
+        import soundfile as sf
+        import pyrubberband as pyrb
+    
+        target_text = target_text.strip()
+        if not target_text:
+            raise HTTPException(400, "Target text cannot be empty")
+        if len(target_text) > 500:
+            raise HTTPException(400, "Target text exceeds 500 characters")
+    
+        speed = max(0.5, min(2.0, float(speed)))
+    
+        # Sync read from the uploaded file object
+        data = ref_audio.file.read()
+        try:
+            arr, sr = sf.read(io.BytesIO(data))
+        except Exception as e:
+            raise HTTPException(400, f"Could not read reference audio: {e}")
+    
+        ref_path = f"/tmp/ref_{uuid.uuid4().hex}.wav"
+        sf.write(ref_path, arr, sr)
+    
+        try:
+            wavs, sr = self.base_model.generate_voice_clone(
+                text=target_text,
+                language="English",
+                ref_audio=ref_path,
+                ref_text=ref_text.strip() if ref_text and ref_text.strip() else None,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Cloning failed: {e}")
+        finally:
             try:
-                arr, sr = sf.read(io.BytesIO(data))
-            except Exception as e:
-                raise HTTPException(400, f"Could not read reference audio: {e}")
-
-            ref_path = f"/tmp/ref_{uuid.uuid4().hex}.wav"
-            sf.write(ref_path, arr, sr)
-
-            try:
-                wavs, sr = self.base_model.generate_voice_clone(
-                    text=target_text,
-                    language="English",
-                    ref_audio=ref_path,
-                    ref_text=ref_text.strip() if ref_text and ref_text.strip() else None,
-                )
-            except Exception as e:
-                raise HTTPException(500, f"Cloning failed: {e}")
-            finally:
-                try:
-                    os.remove(ref_path)
-                except OSError:
-                    pass
-
-            # ---- Apply speed control (time-stretch, pitch preserved) ----
-            audio = np.asarray(wavs[0]).squeeze()
-            if abs(speed - 1.0) > 0.01:
-                audio = pyrb.time_stretch(audio, sr, speed)
-
-            fname = f"{uuid.uuid4().hex}.wav"
-            out_path = os.path.join(OUTPUT_DIR, fname)
-            sf.write(out_path, audio, sr)
-            data_vol.commit()
-
-            return {
-                "audio_url": f"/api/audio/{fname}",
-                "speed": speed,
-            }
+                os.remove(ref_path)
+            except OSError:
+                pass
+    
+        audio = np.asarray(wavs[0]).squeeze()
+        if abs(speed - 1.0) > 0.01:
+            audio = pyrb.time_stretch(audio, sr, speed)
+    
+        fname = f"{uuid.uuid4().hex}.wav"
+        out_path = os.path.join(OUTPUT_DIR, fname)
+        sf.write(out_path, audio, sr)
+        data_vol.commit()  # now safe — runs in the thread pool
+    
+        return {
+            "audio_url": f"/api/audio/{fname}",
+            "speed": speed,
+        }
 
         # -------- Serve generated audio --------
         @fapp.get("/api/audio/{fname}")
